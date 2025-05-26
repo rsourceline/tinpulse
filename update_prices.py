@@ -1,13 +1,11 @@
 #!/usr/bin/env python
 """
-update_prices.py  – safe, full-version
+update_prices.py  – safe merge, first-run tolerant
 ────────────────────────────────────────────────────────────────────────────
-• Refreshes live price columns every 30 minutes.
-• Adds/updates a 'status' column:
-      Ranked   – rank ≤ 1250
-      Unranked – blank rank or > 1250
-• Keeps every pre-existing row; appends new coins.
-• Writes fixed-point numbers (no scientific notation).
+• Updates live price columns (rank, price, changes, cap, volume)
+• Adds a 'status' column: Ranked (rank ≤ 1250) or Unranked
+• Handles the case where cryptos.csv is missing or blank (first run)
+• Writes fixed-point numbers (float_format="%.12f") – no scientific notation
 """
 
 from pathlib import Path
@@ -15,6 +13,7 @@ import time, requests, pandas as pd
 
 CSV_PATH    = Path("cryptos.csv")
 RANK_CUTOFF = 1250
+
 VS_CURRENCY = "usd"
 PAGE_SIZE   = 250
 PAGE_SLEEP  = 0.3
@@ -26,7 +25,7 @@ LIVE_COLS = [
     "status",
 ]
 
-# ─── fetch all pages of /coins/markets ────────────────────────────────────
+# ─── fetch market snapshot ───────────────────────────────────────────────
 def fetch_markets() -> pd.DataFrame:
     rows, page = [], 1
     while True:
@@ -42,10 +41,11 @@ def fetch_markets() -> pd.DataFrame:
             ),
             timeout=20,
         )
-        chunk = r.json()
-        if not chunk:
+        data = r.json()
+        if not data:
             break
-        rows.extend(chunk); page += 1
+        rows.extend(data)
+        page += 1
         time.sleep(PAGE_SLEEP)
 
     df = pd.json_normalize(rows)[
@@ -62,13 +62,12 @@ def fetch_markets() -> pd.DataFrame:
     ].rename(
         columns={
             "market_cap_rank": "rank",
-            "current_price": "price_usd",
+            "current_price":    "price_usd",
             "price_change_percentage_24h": "change_24h_pct",
-            "total_volume": "volume_24h",
+            "total_volume":     "volume_24h",
         }
     )
 
-    # extract nested USD values
     df["change_7d_pct"] = df["price_change_percentage_7d_in_currency"].apply(
         lambda d: d.get("usd") if isinstance(d, dict) else None
     )
@@ -82,55 +81,51 @@ def fetch_markets() -> pd.DataFrame:
         inplace=True,
     )
 
-    # status tag
     df["status"] = df["rank"].apply(
         lambda r: "Ranked" if pd.notna(r) and r <= RANK_CUTOFF else "Unranked"
     )
     return df
 
-# ─── helper: strip blank IDs ──────────────────────────────────────────────
-def strip_blank_ids(df):
+# ─── helper: strip rows with blank IDs ────────────────────────────────────
+def strip_blank(df):
     return df[df["id"].notna() & (df["id"].astype(str).str.strip() != "")]
 
-# ─── safe merge/update ────────────────────────────────────────────────────
+# ─── safe merge that tolerates empty first-run CSV ────────────────────────
 def safe_merge(local: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
-    local  = strip_blank_ids(local)
-    market = strip_blank_ids(market)
+    market = strip_blank(market)
 
-    # ensure both dataframes have all live columns
-    for col in LIVE_COLS:
-        if col not in local.columns:
-            local[col] = pd.NA
-        if col not in market.columns:
-            market[col] = pd.NA
-
-    # map new live values
-    live_map = market.set_index("id")[LIVE_COLS].to_dict("index")
-
-    if not local.empty:
-        for idx, row in local.iterrows():
+    # If local is empty or missing 'id', start fresh
+    if local.empty or "id" not in local.columns:
+        base = market.copy()
+    else:
+        local = strip_blank(local)
+        # ensure all live columns exist
+        for col in LIVE_COLS:
+            if col not in local.columns:
+                local[col] = pd.NA
+        base = local.copy()
+        live_map = market.set_index("id")[LIVE_COLS].to_dict("index")
+        for idx, row in base.iterrows():
             cid = row["id"]
             if cid in live_map:
                 for col in LIVE_COLS:
-                    local.at[idx, col] = live_map[cid][col]
-    else:
-        local = market.copy()
+                    base.at[idx, col] = live_map[cid][col]
 
-    # append truly new coins
-    new_ids = set(market["id"]) - set(local["id"])
+    # append coins that weren’t in base
+    new_ids = set(market["id"]) - set(base["id"])
     if new_ids:
-        local = pd.concat([local, market[market["id"].isin(new_ids)]],
-                          ignore_index=True)
-    return local
+        base = pd.concat([base, market[market["id"].isin(new_ids)]],
+                         ignore_index=True)
 
-# ─── main ─────────────────────────────────────────────────────────────────
+    return base
+
+# ─── main ────────────────────────────────────────────────────────────────
 def main():
     df_local  = pd.read_csv(CSV_PATH, low_memory=False) if CSV_PATH.exists() else pd.DataFrame()
     df_market = fetch_markets()
     merged    = safe_merge(df_local, df_market)
-
     merged.to_csv(CSV_PATH, index=False, float_format="%.12f")
-    print(f"CSV rows after update: {len(merged):,}")
+    print(f"Rows after update: {len(merged):,}")
 
 if __name__ == "__main__":
     main()
