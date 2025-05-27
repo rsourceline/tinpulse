@@ -1,11 +1,13 @@
 #!/usr/bin/env python
 """
-update_prices.py  – safe merge, first-run tolerant
+update_prices.py
 ────────────────────────────────────────────────────────────────────────────
-• Updates live price columns (rank, price, changes, cap, volume)
-• Adds a 'status' column: Ranked (rank ≤ 1250) or Unranked
-• Handles the case where cryptos.csv is missing or blank (first run)
-• Writes fixed-point numbers (float_format="%.12f") – no scientific notation
+• Refreshes high-frequency market columns every 30 min.
+• Adds / updates:
+    rank, price_usd, change_24h_pct, change_7d_pct, change_1y_pct,
+    market_cap, volume_24h, status (Ranked/Unranked), last_updated
+• Tolerates first-run empty CSV and never drops rows.
+• Writes fixed-point numbers (float_format="%.12f").
 """
 
 from pathlib import Path
@@ -22,7 +24,7 @@ LIVE_COLS = [
     "rank", "price_usd",
     "change_24h_pct", "change_7d_pct", "change_1y_pct",
     "market_cap", "volume_24h",
-    "status",
+    "status", "last_updated",
 ]
 
 # ─── fetch market snapshot ───────────────────────────────────────────────
@@ -51,6 +53,7 @@ def fetch_markets() -> pd.DataFrame:
     df = pd.json_normalize(rows)[
         [
             "id",
+            "last_updated",
             "market_cap_rank",
             "current_price",
             "price_change_percentage_24h",
@@ -61,6 +64,7 @@ def fetch_markets() -> pd.DataFrame:
         ]
     ].rename(
         columns={
+            "last_updated": "last_updated",
             "market_cap_rank": "rank",
             "current_price":    "price_usd",
             "price_change_percentage_24h": "change_24h_pct",
@@ -90,16 +94,14 @@ def fetch_markets() -> pd.DataFrame:
 def strip_blank(df):
     return df[df["id"].notna() & (df["id"].astype(str).str.strip() != "")]
 
-# ─── safe merge that tolerates empty first-run CSV ────────────────────────
+# ─── safe merge (handles first run) ───────────────────────────────────────
 def safe_merge(local: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
     market = strip_blank(market)
 
-    # If local is empty or missing 'id', start fresh
     if local.empty or "id" not in local.columns:
         base = market.copy()
     else:
         local = strip_blank(local)
-        # ensure all live columns exist
         for col in LIVE_COLS:
             if col not in local.columns:
                 local[col] = pd.NA
@@ -111,12 +113,10 @@ def safe_merge(local: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
                 for col in LIVE_COLS:
                     base.at[idx, col] = live_map[cid][col]
 
-    # append coins that weren’t in base
     new_ids = set(market["id"]) - set(base["id"])
     if new_ids:
         base = pd.concat([base, market[market["id"].isin(new_ids)]],
                          ignore_index=True)
-
     return base
 
 # ─── main ────────────────────────────────────────────────────────────────
