@@ -1,21 +1,22 @@
 #!/usr/bin/env python
 """
-update_prices.py
-────────────────────────────────────────────────────────────────────────────
-• Refreshes high-frequency market columns every 30 min.
-• Adds / updates:
-    rank, price_usd, change_24h_pct, change_7d_pct, change_1y_pct,
-    market_cap, volume_24h, status (Ranked/Unranked), last_updated
-• Tolerates first-run empty CSV and never drops rows.
-• Writes fixed-point numbers (float_format="%.12f").
+update_prices.py  – writes to /opt/tinpulse/cryptos.csv
+
+• Updates rank, price, % changes, market cap, volume
+• Adds/updates status (Ranked / Unranked)
+• Adds/updates last_updated timestamp
+• Handles first-run empty CSV
+• Writes fixed-point numbers to avoid scientific notation
 """
 
 from pathlib import Path
 import time, requests, pandas as pd
 
-CSV_PATH    = Path("cryptos.csv")
-RANK_CUTOFF = 1250
+# <<< absolute path so cron or manual runs always overwrite the right file
+CSV_PATH = Path("/opt/tinpulse/cryptos.csv")
+# >>>
 
+RANK_CUTOFF = 1250
 VS_CURRENCY = "usd"
 PAGE_SIZE   = 250
 PAGE_SLEEP  = 0.3
@@ -27,8 +28,8 @@ LIVE_COLS = [
     "status", "last_updated",
 ]
 
-# ─── fetch market snapshot ───────────────────────────────────────────────
-def fetch_markets() -> pd.DataFrame:
+# ─── fetch snapshot ──────────────────────────────────────────────────────
+def fetch_markets():
     rows, page = [], 1
     while True:
         r = requests.get(
@@ -43,10 +44,10 @@ def fetch_markets() -> pd.DataFrame:
             ),
             timeout=20,
         )
-        data = r.json()
-        if not data:
+        chunk = r.json()
+        if not chunk:
             break
-        rows.extend(data)
+        rows.extend(chunk)
         page += 1
         time.sleep(PAGE_SLEEP)
 
@@ -64,7 +65,6 @@ def fetch_markets() -> pd.DataFrame:
         ]
     ].rename(
         columns={
-            "last_updated": "last_updated",
             "market_cap_rank": "rank",
             "current_price":    "price_usd",
             "price_change_percentage_24h": "change_24h_pct",
@@ -90,14 +90,12 @@ def fetch_markets() -> pd.DataFrame:
     )
     return df
 
-# ─── helper: strip rows with blank IDs ────────────────────────────────────
+# ─── helpers ─────────────────────────────────────────────────────────────
 def strip_blank(df):
     return df[df["id"].notna() & (df["id"].astype(str).str.strip() != "")]
 
-# ─── safe merge (handles first run) ───────────────────────────────────────
-def safe_merge(local: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
+def safe_merge(local, market):
     market = strip_blank(market)
-
     if local.empty or "id" not in local.columns:
         base = market.copy()
     else:
@@ -106,13 +104,12 @@ def safe_merge(local: pd.DataFrame, market: pd.DataFrame) -> pd.DataFrame:
             if col not in local.columns:
                 local[col] = pd.NA
         base = local.copy()
-        live_map = market.set_index("id")[LIVE_COLS].to_dict("index")
+        live = market.set_index("id")[LIVE_COLS].to_dict("index")
         for idx, row in base.iterrows():
             cid = row["id"]
-            if cid in live_map:
+            if cid in live:
                 for col in LIVE_COLS:
-                    base.at[idx, col] = live_map[cid][col]
-
+                    base.at[idx, col] = live[cid][col]
     new_ids = set(market["id"]) - set(base["id"])
     if new_ids:
         base = pd.concat([base, market[market["id"].isin(new_ids)]],
